@@ -1,10 +1,19 @@
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{HashMap, hash_map::Entry},
     sync::{Arc, RwLock},
 };
 
-use axum::{Json, Router, extract::State, response::IntoResponse, routing::post, serve};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    serve,
+};
+use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::net::TcpListener;
 
 #[derive(Clone)]
@@ -12,7 +21,7 @@ struct AppState {
     bids: Arc<RwLock<Vec<Order>>>,
     asks: Arc<RwLock<Vec<Order>>>,
     users: Arc<RwLock<Vec<User>>>,
-    ticker:String
+    ticker: String,
 }
 
 impl Default for AppState {
@@ -37,19 +46,22 @@ impl Default for AppState {
                 .collect(),
             },
         ];
-        Self { bids:Arc::new(RwLock::new(vec![])), asks: Arc::new(RwLock::new(vec![])), users: Arc::new(RwLock::new(users)), ticker: String::from("GOOGLE"), }
+        Self {
+            bids: Arc::new(RwLock::new(vec![])),
+            asks: Arc::new(RwLock::new(vec![])),
+            users: Arc::new(RwLock::new(users)),
+            ticker: String::from("GOOGLE"),
+        }
     }
 }
 
 #[tokio::main]
 async fn main() {
-
-
     let state: AppState = AppState::default();
 
-
     let router: Router = Router::new()
-        .route("/order", post(order))
+        .route("/order", post(handle_order))
+        .route("/balance/{id}", get(get_balance))
         .with_state(state.clone());
 
     let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -57,7 +69,7 @@ async fn main() {
     serve(listener, router).await.unwrap();
 }
 
-
+#[derive(Serialize, Deserialize)]
 struct User {
     id: String,
     balances: HashMap<String, f64>,
@@ -69,10 +81,11 @@ enum Side {
     Ask,
     Bid,
 }
+#[derive(Serialize, Deserialize, Debug, Clone)]
 
 struct Order {
     user_id: String,
-    price: f64,
+    price: OrderedFloat<f64>,
     quantity: f64,
 }
 
@@ -85,95 +98,173 @@ struct OrderDto {
 }
 
 #[axum::debug_handler]
-async fn order(
+async fn get_balance(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    let users = state.users.read().unwrap();
+
+    for user in users.iter() {
+        if user.id == id {
+            return Json(user).into_response();
+        }
+    }
+
+    return StatusCode::NOT_FOUND.into_response();
+}
+
+#[axum::debug_handler]
+async fn handle_order(
     State(state): State<AppState>,
     Json(order_dto): Json<OrderDto>,
 ) -> impl IntoResponse {
     println!("{:?}", order_dto);
-    fill_orders(state, &order_dto);
-    Json("Ok")
+    let remaining_to_fill = fill_orders(&state, &order_dto);
+    let users = state.users.read().unwrap();
+    let current_user_id = order_dto.user_id;
+    let price = order_dto.price;
+
+    if remaining_to_fill == 0.0 {
+        return Json(
+            json!({"unfilled":remaining_to_fill,"filled":order_dto.quantity,"users":*users}),
+        )
+        .into_response();
+    };
+    match order_dto.side {
+        Side::Bid => {
+            let mut bids = state.bids.write().unwrap();
+            let order = Order {
+                user_id: current_user_id,
+                price: OrderedFloat(price),
+                quantity: remaining_to_fill,
+            };
+            bids.push(order);
+            bids.sort_by_key(|o| o.price.clone());
+        }
+        Side::Ask => {
+            let mut asks = state.asks.write().unwrap();
+            let order = Order {
+                user_id: current_user_id,
+                price: OrderedFloat(price),
+                quantity: remaining_to_fill,
+            };
+            asks.push(order);
+            asks.sort_by_key(|o| o.price.clone());
+        }
+    };
+
+    return Json(
+        json!({"unfilled":remaining_to_fill,"filled":remaining_to_fill-order_dto.quantity, "users":*users}),
+    )
+    .into_response();
 }
 
-fn fill_orders(state:  AppState, order_dto: &OrderDto)->f64 {
-    let mut remaining_quantity = order_dto.quantity;
-    let mut remove=0;
+fn fill_orders(state: &AppState, order_dto: &OrderDto) -> f64 {
+    let mut asked_quantity = order_dto.quantity;
+    let mut remove = 0;
 
     match order_dto.side {
         Side::Bid => {
             let mut asks = state.asks.write().unwrap();
             for order in asks.iter_mut().rev() {
-                if order.price > order_dto.price {
+                if order.price > OrderedFloat(order_dto.price) {
                     break;
                 } else {
-                    if order.quantity > remaining_quantity {
-                        order.quantity -= remaining_quantity;
-                        flip_balance(&order.user_id,&order_dto.user_id, remaining_quantity,order.price,&state);
-                        remaining_quantity=0.0;
-                    }else {
-                        remaining_quantity-=order.quantity;
-                        flip_balance(&order.user_id,&order_dto.user_id, order.quantity,order.price,&state);
-                        remove+=1
+                    if order.quantity > asked_quantity {
+                        order.quantity -= asked_quantity;
+                        flip_balance(
+                            &order.user_id,
+                            &order_dto.user_id,
+                            asked_quantity,
+                            order.price,
+                            &state,
+                        );
+                        asked_quantity = 0.0;
+                    } else {
+                        asked_quantity -= order.quantity;
+                        flip_balance(
+                            &order.user_id,
+                            &order_dto.user_id,
+                            order.quantity,
+                            order.price,
+                            &state,
+                        );
+                        remove += 1
                     }
                 }
             }
 
-            for _ in 0..remove{
+            for _ in 0..remove {
                 asks.pop();
             }
-            return remaining_quantity; 
+            return asked_quantity;
         }
+        // ask is sellers ask for a stock
         Side::Ask => {
-            let mut bids= state.bids.write().unwrap();
+            let mut bids = state.bids.write().unwrap();
+            let mut remove = 0;
 
-            for order in bids.iter_mut().rev(){
-                if order.quantity>remaining_quantity{
-
-                }else{
-                    
+            for order in bids.iter_mut().rev() {
+                if order.quantity > asked_quantity {
+                    order.quantity -= asked_quantity;
+                    flip_balance(
+                        &order_dto.user_id,
+                        &order.user_id,
+                        order_dto.quantity,
+                        OrderedFloat(order_dto.price),
+                        &state,
+                    );
+                    asked_quantity = 0.0;
+                } else {
+                    asked_quantity -= order.quantity;
+                    flip_balance(
+                        &order_dto.user_id,
+                        &order.user_id,
+                        order.quantity,
+                        OrderedFloat(order_dto.price),
+                        &state,
+                    );
+                    remove += 1;
                 }
             }
 
+            for _ in 0..remove {
+                bids.pop();
+            }
 
-
-            return  0.0;
-
+            return asked_quantity;
         }
     }
 }
 
-fn flip_balance(user1:&String, user2: &String, quantity:f64, price:f64, state:  &AppState) {
+fn flip_balance(
+    user1: &String,
+    user2: &String,
+    quantity: f64,
+    price: OrderedFloat<f64>,
+    state: &AppState,
+) {
     let mut users = state.users.write().unwrap();
-    for user in users.iter_mut(){
-
+    for user in users.iter_mut() {
         // user 1 is seller and user 2 is buyer
 
-        if user.id==*user1{
+        if user.id == *user1 {
             match user.balances.entry(state.ticker.clone()) {
-                Entry::Occupied(mut entry)=>*entry.get_mut()-=quantity,
-                Entry::Vacant(entry)=> println!("{:?} not found",entry)
+                Entry::Occupied(mut entry) => *entry.get_mut() -= quantity,
+                Entry::Vacant(entry) => println!("{:?} not found", entry),
             }
-            match  user.balances.entry("USD".to_string()) {
-                Entry::Occupied(mut entry)=>*entry.get_mut()+=price*quantity,
-                Entry::Vacant(entry)=>println!("{:?} not found",entry)
-            }   
+            match user.balances.entry("USD".to_string()) {
+                Entry::Occupied(mut entry) => *entry.get_mut() += *price * quantity,
+                Entry::Vacant(entry) => println!("{:?} not found", entry),
+            }
         }
-        if user.id==*user2{
-
-            match  user.balances.entry(state.ticker.clone()) {
-                Entry::Occupied(mut entry)=>*entry.get_mut()+=quantity,
-                Entry::Vacant(entry)=>println!("{:?} not found",entry)
-                
+        if user.id == *user2 {
+            match user.balances.entry(state.ticker.clone()) {
+                Entry::Occupied(mut entry) => *entry.get_mut() += quantity,
+                Entry::Vacant(entry) => println!("{:?} not found", entry),
             }
 
-            match  user.balances.entry("USD".to_string()) {
-                Entry::Occupied(mut entry)=>*entry.get_mut()-=quantity*price,
-                Entry::Vacant(entry)=>println!("{:?} not found",entry)
-                
+            match user.balances.entry("USD".to_string()) {
+                Entry::Occupied(mut entry) => *entry.get_mut() -= *price * quantity,
+                Entry::Vacant(entry) => println!("{:?} not found", entry),
             }
-            
         }
-
     }
-
-
 }

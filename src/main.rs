@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     collections::{HashMap, hash_map::Entry},
     sync::{Arc, RwLock},
 };
@@ -60,7 +61,7 @@ async fn main() {
     let state: AppState = AppState::default();
 
     let router: Router = Router::new()
-        .route("/order", post(handle_order))
+        .route("/order", post(handle_order).get(get_orderbook))
         .route("/balance/{id}", get(get_balance))
         .with_state(state.clone());
 
@@ -110,6 +111,13 @@ async fn get_balance(State(state): State<AppState>, Path(id): Path<String>) -> i
     return StatusCode::NOT_FOUND.into_response();
 }
 
+async fn get_orderbook(State(state): State<AppState>) -> impl IntoResponse {
+    let asks = state.asks.read().unwrap();
+    let bids = state.bids.read().unwrap();
+
+    return Json(json!({"asks":*asks,"bids":*bids}));
+}
+
 #[axum::debug_handler]
 async fn handle_order(
     State(state): State<AppState>,
@@ -146,7 +154,7 @@ async fn handle_order(
                 quantity: remaining_to_fill,
             };
             asks.push(order);
-            asks.sort_by_key(|o| o.price.clone());
+            asks.sort_by_key(|o| Reverse(o.price.clone()));
         }
     };
 
@@ -164,6 +172,10 @@ fn fill_orders(state: &AppState, order_dto: &OrderDto) -> f64 {
         Side::Bid => {
             let mut asks = state.asks.write().unwrap();
             for order in asks.iter_mut().rev() {
+                // ask array is reverse sorted
+                // we start from last entry in asked order (starting reverse order)
+                // if lowest price in sell order is greater than buying price
+                // break the loop and add order to book
                 if order.price > OrderedFloat(order_dto.price) {
                     break;
                 } else {
@@ -202,26 +214,32 @@ fn fill_orders(state: &AppState, order_dto: &OrderDto) -> f64 {
             let mut remove = 0;
 
             for order in bids.iter_mut().rev() {
-                if order.quantity > asked_quantity {
-                    order.quantity -= asked_quantity;
-                    flip_balance(
-                        &order_dto.user_id,
-                        &order.user_id,
-                        order_dto.quantity,
-                        OrderedFloat(order_dto.price),
-                        &state,
-                    );
-                    asked_quantity = 0.0;
+                // if even largest price in buy order is less than the asked price
+                // break the loop as this order cant be fulfilled
+                if OrderedFloat(order_dto.price) > order.price {
+                    break;
                 } else {
-                    asked_quantity -= order.quantity;
-                    flip_balance(
-                        &order_dto.user_id,
-                        &order.user_id,
-                        order.quantity,
-                        OrderedFloat(order_dto.price),
-                        &state,
-                    );
-                    remove += 1;
+                    if order.quantity > asked_quantity {
+                        order.quantity -= asked_quantity;
+                        flip_balance(
+                            &order_dto.user_id,
+                            &order.user_id,
+                            asked_quantity,
+                            order.price,
+                            &state,
+                        );
+                        asked_quantity = 0.0;
+                    } else {
+                        asked_quantity -= order.quantity;
+                        flip_balance(
+                            &order_dto.user_id,
+                            &order.user_id,
+                            order.quantity,
+                            order.price,
+                            &state,
+                        );
+                        remove += 1;
+                    }
                 }
             }
 

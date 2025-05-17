@@ -5,12 +5,7 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
-    extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{get, post},
-    serve,
+    extract::{Path, State}, http::StatusCode, response::IntoResponse, routing::{get, post}, serve, Json, Router
 };
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
@@ -61,7 +56,7 @@ async fn main() {
     let state: AppState = AppState::default();
 
     let router: Router = Router::new()
-        .route("/order", post(handle_order).get(get_orderbook))
+        .route("/order", post(handle_order).get(get_orderbook)).route("/quote",post(get_quote))
         .route("/balance/{id}", get(get_balance))
         .with_state(state.clone());
 
@@ -69,6 +64,21 @@ async fn main() {
 
     serve(listener, router).await.unwrap();
 }
+
+
+#[derive(Serialize)]
+struct Error {
+    message: String,
+}
+
+impl Error {
+    pub fn new(msg: &str) -> Self {
+        Error {
+            message: msg.to_string(),
+        }
+    }
+}
+
 
 #[derive(Serialize, Deserialize)]
 struct User {
@@ -98,6 +108,7 @@ struct OrderDto {
     user_id: String,
 }
 
+
 #[axum::debug_handler]
 async fn get_balance(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let users = state.users.read().unwrap();
@@ -117,6 +128,69 @@ async fn get_orderbook(State(state): State<AppState>) -> impl IntoResponse {
 
     return Json(json!({"asks":*asks,"bids":*bids}));
 }
+
+#[derive(Serialize, Deserialize)]
+struct QuoteDto {
+    side: Side,
+    quantity: f64,
+}
+async fn get_quote(State(state):State<AppState>,Json(order_dto):Json<QuoteDto>)-> impl IntoResponse{
+
+    match  order_dto.side {
+        Side::Ask=>{
+            let mut quantity= order_dto.quantity.clone();
+            let mut price =OrderedFloat(0.0);
+            let bids= state.bids.read().unwrap();
+            for order in bids.iter().rev(){
+                if quantity<=0.0 {
+                    break;
+                }
+                if order.quantity>= quantity {
+                    price+=order.price*quantity;
+                    quantity=0.0;
+                    break;
+                }else{
+                    price+=order.price* (order.quantity);
+                    quantity-=order.quantity;
+                }
+            }
+
+            if quantity>0.0 {
+                return  Json(Error::new("Order cannot be fulfilled")).into_response();
+            }
+
+            return Json(json!({"avg_price":price/order_dto.quantity})).into_response();
+
+        },
+        Side::Bid=>{
+            let mut quantity = order_dto.quantity;
+            let mut price = OrderedFloat(0.0);
+            let asks = state.asks.read().unwrap(); // assuming you have `asks` in state
+        
+            for order in asks.iter().rev() {
+                if quantity <= 0.0 {
+                    break;
+                }
+        
+                if order.quantity >= quantity {
+                    price += order.price * quantity;
+                    quantity=0.0;
+                    break;
+                } else {
+                    price += order.price * (order.quantity);
+                    quantity -= order.quantity;
+                }
+            }
+        
+            if quantity > 0.0 {
+                return Json(Error::new("Order cannot be fulfilled")).into_response();
+            }
+        
+            return Json(json!({ "avg_price": price / order_dto.quantity })).into_response();
+        }
+    };
+}
+
 
 #[axum::debug_handler]
 async fn handle_order(
